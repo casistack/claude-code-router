@@ -5,7 +5,7 @@ import {
 } from "@anthropic-ai/sdk/resources/messages";
 import { get_encoding } from "tiktoken";
 import { sessionUsageCache, Usage } from "./cache";
-import { readFile } from 'fs/promises'
+import { readFile } from "fs/promises";
 
 const enc = get_encoding("cl100k_base");
 
@@ -69,18 +69,47 @@ const getUseModel = async (
   config: any,
   lastUsage?: Usage | undefined
 ) => {
+  // If an agent (like imageAgent) already set a fully-qualified provider,model keep it
+  // We still run other routing logic only when model is an alias (e.g. "default") or single provider string
+  const originalModel = req.body.model;
   if (req.body.model.includes(",")) {
     const [provider, model] = req.body.model.split(",");
     const finalProvider = config.Providers.find(
-        (p: any) => p.name.toLowerCase() === provider
+      (p: any) => p.name.toLowerCase() === provider
     );
     const finalModel = finalProvider?.models?.find(
-        (m: any) => m.toLowerCase() === model
+      (m: any) => m.toLowerCase() === model
     );
     if (finalProvider && finalModel) {
       return `${finalProvider.name},${finalModel}`;
     }
     return req.body.model;
+  }
+
+  // Auto image routing: if any user message contains an image part and a Router.image is configured
+  // and current model is an alias (e.g. "default") or equals config.Router.default, prefer Router.image.
+  try {
+    if (config.Router?.image) {
+      const hasImage =
+        Array.isArray(req.body.messages) &&
+        req.body.messages.some(
+          (msg: any) =>
+            msg.role === "user" &&
+            Array.isArray(msg.content) &&
+            msg.content.some((c: any) => c.type === "image")
+        );
+      if (hasImage) {
+        const aliasModels = ["default", "image"];
+        if (
+          aliasModels.includes(originalModel) ||
+          originalModel === config.Router.default
+        ) {
+          return config.Router.image;
+        }
+      }
+    }
+  } catch (e) {
+    req.log?.warn?.(`image auto-route check failed: ${(e as Error).message}`);
   }
 
   // if tokenCount is greater than the configured threshold, use the long context model
@@ -94,7 +123,7 @@ const getUseModel = async (
     (lastUsageThreshold || tokenCountThreshold) &&
     config.Router.longContext
   ) {
-        req.log.info(
+    req.log.info(
       `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold}`
     );
     return config.Router.longContext;
@@ -148,9 +177,13 @@ export const router = async (req: any, _res: any, context: any) => {
   }
   const lastMessageUsage = sessionUsageCache.get(req.sessionId);
   const { messages, system = [], tools }: MessageCreateParamsBase = req.body;
-  if (config.REWRITE_SYSTEM_PROMPT && system.length > 1 && system[1]?.text?.includes('<env>')) {
-    const prompt = await readFile(config.REWRITE_SYSTEM_PROMPT, 'utf-8');
-    system[1].text = `${prompt}<env>${system[1].text.split('<env>').pop()}`
+  if (
+    config.REWRITE_SYSTEM_PROMPT &&
+    system.length > 1 &&
+    system[1]?.text?.includes("<env>")
+  ) {
+    const prompt = await readFile(config.REWRITE_SYSTEM_PROMPT, "utf-8");
+    system[1].text = `${prompt}<env>${system[1].text.split("<env>").pop()}`;
   }
 
   try {
@@ -166,7 +199,7 @@ export const router = async (req: any, _res: any, context: any) => {
         const customRouter = require(config.CUSTOM_ROUTER_PATH);
         req.tokenCount = tokenCount; // Pass token count to custom router
         model = await customRouter(req, config, {
-          event
+          event,
         });
       } catch (e: any) {
         req.log.error(`failed to load custom router: ${e.message}`);
