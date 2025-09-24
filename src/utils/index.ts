@@ -14,10 +14,13 @@ import { cleanupLogFiles } from "./logCleanup";
 const interpolateEnvVars = (obj: any): any => {
   if (typeof obj === "string") {
     // Replace $VAR_NAME or ${VAR_NAME} with environment variable values
-    return obj.replace(/\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)/g, (match, braced, unbraced) => {
-      const varName = braced || unbraced;
-      return process.env[varName] || match; // Keep original if env var doesn't exist
-    });
+    return obj.replace(
+      /\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)/g,
+      (match, braced, unbraced) => {
+        const varName = braced || unbraced;
+        return process.env[varName] || match; // Keep original if env var doesn't exist
+      }
+    );
   } else if (Array.isArray(obj)) {
     return obj.map(interpolateEnvVars);
   } else if (obj !== null && typeof obj === "object") {
@@ -90,29 +93,22 @@ export const readConfigFile = async () => {
         // Backup existing config file if it exists
         const backupPath = await backupConfigFile();
         if (backupPath) {
-          console.log(
-              `Backed up existing configuration file to ${backupPath}`
-          );
+          console.log(`Backed up existing configuration file to ${backupPath}`);
         }
         const config = {
           PORT: 3456,
           Providers: [],
           Router: {},
-        }
+        };
         // Create a minimal default config file
         await writeConfigFile(config);
         console.log(
-            "Created minimal default configuration file at ~/.claude-code-router/config.json"
+          "Created minimal default configuration file at ~/.claude-code-router/config.json"
         );
-        console.log(
-            "Please edit this file with your actual configuration."
-        );
-        return config
+        console.log("Please edit this file with your actual configuration.");
+        return config;
       } catch (error: any) {
-        console.error(
-            "Failed to create default configuration:",
-            error.message
-        );
+        console.error("Failed to create default configuration:", error.message);
         process.exit(1);
       }
     } else {
@@ -125,8 +121,13 @@ export const readConfigFile = async () => {
 
 export const backupConfigFile = async () => {
   try {
-    if (await fs.access(CONFIG_FILE).then(() => true).catch(() => false)) {
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    if (
+      await fs
+        .access(CONFIG_FILE)
+        .then(() => true)
+        .catch(() => false)
+    ) {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
       const backupPath = `${CONFIG_FILE}.${timestamp}.bak`;
       await fs.copyFile(CONFIG_FILE, backupPath);
 
@@ -138,7 +139,9 @@ export const backupConfigFile = async () => {
 
         // Find all backup files for this config
         const backupFiles = files
-          .filter(file => file.startsWith(configFileName) && file.endsWith('.bak'))
+          .filter(
+            (file) => file.startsWith(configFileName) && file.endsWith(".bak")
+          )
           .sort()
           .reverse(); // Sort in descending order (newest first)
 
@@ -169,6 +172,16 @@ export const writeConfigFile = async (config: any) => {
 
 export const initConfig = async () => {
   const config = await readConfigFile();
+  // Inject Image hybrid defaults (non-breaking) if not present
+  if (!config.Image || typeof config.Image !== "object") {
+    config.Image = { mode: "hybrid" };
+  } else {
+    if (!config.Image.mode) config.Image.mode = "hybrid";
+    const allowed = ["direct", "tool", "hybrid"];
+    if (!allowed.includes(config.Image.mode)) {
+      config.Image.mode = "hybrid";
+    }
+  }
   Object.assign(process.env, config);
   return config;
 };

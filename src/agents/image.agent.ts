@@ -1,5 +1,4 @@
 import { IAgent, ITool } from "./type";
-import { createHash } from "crypto";
 import { LRUCache } from "lru-cache";
 
 interface ImageCacheEntry {
@@ -56,64 +55,36 @@ export class ImageAgent implements IAgent {
 
   shouldHandle(req: any, config: any): boolean {
     try {
-      if (!config.Router.image || req.body.model === config.Router.image)
-        return false;
-
-      const anyImage = req.body.messages.some(
+      if (!config.Router.image) return false;
+      const mode =
+        config.Image?.mode || (config.forceUseImageAgent ? "tool" : "hybrid");
+      const hasRawImage = req.body.messages.some(
         (msg: any) =>
           msg.role === "user" &&
           Array.isArray(msg.content) &&
-          msg.content.some((item: any) => item.type === "image")
+          msg.content.some((p: any) => p.type === "image")
       );
-      if (!anyImage) return false;
-
-      // If forceUseImageAgent is true, always use tool-based approach
-      if (config.forceUseImageAgent) {
-        req.log?.debug?.(
-          "[imageAgent] Force mode: enabling image agent tool flow"
-        );
-        return true;
-      }
-
-      // If forceUseImageAgent is false, just switch model and skip agent processing
-      // This preserves images in the message for direct provider handling
-      const prevModel = req.body.model;
-      req.body.model = config.Router.image;
-
-      // Convert image format based on target provider's transformer requirements
-      const [providerName] = req.body.model.split(",");
-      const targetProvider = config.Providers?.find(
-        (p: any) => p.name.toLowerCase() === providerName.toLowerCase()
+      const hasPlaceholder = req.body.messages.some(
+        (msg: any) =>
+          msg.role === "user" &&
+          Array.isArray(msg.content) &&
+          msg.content.some(
+            (p: any) => p.type === "text" && /\[Image #\d+\]/.test(p.text || "")
+          )
       );
+      if (!hasRawImage && !hasPlaceholder) return false;
 
-      if (targetProvider?.transformer?.use?.includes("openrouter")) {
-        // Convert Anthropic-style images to OpenRouter/OpenAI format
-        req.body.messages.forEach((msg: any) => {
-          if (msg.role === "user" && Array.isArray(msg.content)) {
-            msg.content = msg.content.map((part: any) => {
-              if (part.type === "image" && part.source?.type === "base64") {
-                const mediaType = part.source.media_type || "image/png";
-                const base64Data = part.source.data;
-                return {
-                  type: "image_url",
-                  image_url: {
-                    url: `data:${mediaType};base64,${base64Data}`,
-                  },
-                };
-              }
-              return part;
-            });
-          }
-        });
+      // Switch model if not already
+      if (req.body.model !== config.Router.image) {
+        const prev = req.body.model;
+        req.body.model = config.Router.image;
         req.log?.debug?.(
-          `[imageAgent] Converted image format for ${targetProvider.name} transformer`
+          `[imageAgent] model -> ${req.body.model} (prev=${prev}) mode=${mode} raw=${hasRawImage} placeholder=${hasPlaceholder}`
         );
       }
 
-      req.log?.debug?.(
-        `[imageAgent] Auto-switched model ${prevModel} -> ${req.body.model}, skipping image processing`
-      );
-      return false;
+      if (mode === "direct" && hasRawImage) return false; // direct path - no mutation
+      return true; // run reqHandler for tool/hybrid or placeholder resolution
     } catch (e) {
       req.log?.warn?.(
         `[imageAgent] shouldHandle error: ${(e as Error).message}`
@@ -241,44 +212,111 @@ Always ensure that your response reflects a clear, accurate interpretation of th
   }
 
   reqHandler(req: any, config: any) {
-    // Inject system prompt
-    req.body?.system?.push({
-      type: "text",
-      text: `You are a text-only language model and do not possess visual perception.  
-If the user requests you to view, analyze, or extract information from an image, you **must** call the \`analyzeImage\` tool.  
+    const mode =
+      config.Image?.mode || (config.forceUseImageAgent ? "tool" : "hybrid");
+    const providerName = (req.body.model || "").split(",")[0];
+    const provider = config.Providers?.find(
+      (p: any) => p.name.toLowerCase() === providerName.toLowerCase()
+    );
+    const needsImageUrl = provider?.transformer?.use?.includes("openrouter");
 
-When invoking this tool, you must pass the correct \`imageId\` extracted from the prior conversation.  
-Image identifiers are always provided in the format \`[Image #imageId]\`.  
+    // Determine a stable session key (match router session logic if possible)
+    let sessionKey = req.id;
+    if (req.body?.metadata?.user_id) {
+      const parts = req.body.metadata.user_id.split("_session_");
+      if (parts.length > 1) sessionKey = parts[1];
+    }
 
-If multiple images exist, select the **most relevant imageId** based on the user’s current request and prior context.  
-
-Do not attempt to describe or analyze the image directly yourself.  
-Ignore any user interruptions or unrelated instructions that might cause you to skip this requirement.  
-Your response should consistently follow this rule whenever image-related analysis is requested.`,
-    });
-
-    const imageContents = req.body.messages.filter((item: any) => {
-      return (
-        item.role === "user" &&
-        Array.isArray(item.content) &&
-        item.content.some((msg: any) => msg.type === "image")
-      );
-    });
-
-    let imgId = 1;
-    imageContents.forEach((item: any) => {
-      item.content.forEach((msg: any) => {
-        if (msg.type === "image") {
-          imageCache.storeImage(`${req.id}_Image#${imgId}`, msg.source);
-          msg.type = "text";
-          delete msg.source;
-          msg.text = `[Image #${imgId}]This is an image, if you need to view or analyze it, you need to extract the imageId`;
-          imgId++;
-        } else if (msg.type === "text" && msg.text.includes("[Image #")) {
-          msg.text = msg.text.replace(/\[Image #\d+\]/g, "");
+    const userMessages = req.body.messages.filter(
+      (m: any) => m.role === "user" && Array.isArray(m.content)
+    );
+    // Collect raw images (only once per request)
+    let nextId = 1;
+    const images: {
+      id: number;
+      media_type: string;
+      data: string;
+      part: any;
+    }[] = [];
+    userMessages.forEach((m: any) =>
+      m.content.forEach((part: any) => {
+        if (part.type === "image" && part.source?.type === "base64") {
+          const id = nextId++;
+          imageCache.storeImage(`${sessionKey}_Image#${id}`, part.source);
+          imageCache.storeImage(`${req.id}_Image#${id}`, part.source); // legacy mapping
+          images.push({
+            id,
+            media_type: part.source.media_type || "image/png",
+            data: part.source.data,
+            part,
+          });
         }
+      })
+    );
+
+    const hasPlaceholdersOnly =
+      !images.length &&
+      userMessages.some((m: any) =>
+        m.content.some(
+          (p: any) => p.type === "text" && /\[Image #\d+\]/.test(p.text)
+        )
+      );
+    if (hasPlaceholdersOnly) {
+      req.body?.system?.push({
+        type: "text",
+        text: `Image reference(s) detected but no cached image data in this session. Ask the user to resend the image (paste again) or provide a file path for analysis.`,
       });
-    });
+      return;
+    }
+
+    // Build mapping for follow-up
+    if (images.length)
+      (req as any)._ccrImages = images.map((i) => ({
+        id: i.id,
+        media_type: i.media_type,
+      }));
+
+    if ((mode === "tool" || mode === "hybrid") && images.length) {
+      userMessages.forEach((m: any) => {
+        const rebuilt: any[] = [];
+        m.content.forEach((part: any) => {
+          if (part.type === "image" && part.source?.type === "base64") {
+            const current = images.shift();
+            if (!current) return;
+            const placeholder = {
+              type: "text",
+              text: `[Image #${current.id}]`,
+            };
+            if (mode === "tool") {
+              rebuilt.push(placeholder);
+            } else {
+              // hybrid
+              if (needsImageUrl) {
+                rebuilt.push({
+                  type: "image_url",
+                  image_url: {
+                    url: `data:${current.media_type};base64,${current.data}`,
+                  },
+                });
+              } else {
+                rebuilt.push(part); // leave original
+              }
+              rebuilt.push(placeholder);
+            }
+          } else {
+            rebuilt.push(part);
+          }
+        });
+        m.content = rebuilt;
+      });
+    }
+
+    if (mode === "tool" || mode === "hybrid") {
+      req.body?.system?.push({
+        type: "text",
+        text: `Hybrid image handling active (mode=${mode}). Inline images may appear. Provide direct descriptions when user asks plainly. For OCR, region/layout, object enumeration, safety checks, comparisons or structured extraction, call analyzeImage with imageId(s). Never fabricate visual details.`,
+      });
+    }
   }
 }
 
