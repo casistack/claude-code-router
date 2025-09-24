@@ -23,6 +23,64 @@ import { IAgent } from "./agents/type";
 import agentsManager from "./agents";
 import { EventEmitter } from "node:events";
 
+// Global fetch hook to sanitize ALL OpenRouter requests
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async function (input, init) {
+  try {
+    if (
+      typeof input === "string" &&
+      input.includes("openrouter.ai") &&
+      init?.body
+    ) {
+      const body =
+        typeof init.body === "string" ? JSON.parse(init.body) : init.body;
+      if (body?.messages) {
+        let sanitized = false;
+        // Sanitize any malformed image parts
+        body.messages.forEach((msg: any) => {
+          if (Array.isArray(msg.content)) {
+            msg.content = msg.content.filter((part: any) => {
+              // Drop malformed inline_data with just "data:image/png"
+              if (part.type === "image_url") {
+                const url = part.image_url?.url || "";
+                if (url === "data:image/png" || !url.includes(",")) {
+                  console.log(
+                    `[fetchHook] dropped malformed image_url: ${url.slice(
+                      0,
+                      50
+                    )}`
+                  );
+                  sanitized = true;
+                  return false;
+                }
+              }
+              // Drop malformed base64 image parts
+              if (part.type === "image" && part.source?.type === "base64") {
+                const data = part.source.data || "";
+                if (data.length < 100 || data === "data:image/png") {
+                  console.log(
+                    `[fetchHook] dropped malformed base64: length=${data.length}`
+                  );
+                  sanitized = true;
+                  return false;
+                }
+              }
+              return true;
+            });
+          }
+        });
+        if (sanitized) {
+          init.body = JSON.stringify(body);
+          console.log(`[fetchHook] sanitized OpenRouter request`);
+        }
+      }
+    }
+  } catch (e) {
+    // Ignore JSON parse errors
+  }
+  return originalFetch.call(this, input, init);
+};
+
 const event = new EventEmitter();
 
 async function initializeClaudeConfig() {
