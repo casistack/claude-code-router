@@ -232,7 +232,28 @@ Always ensure that your response reflects a clear, accurate interpretation of th
     const provider = config.Providers?.find(
       (p: any) => p.name.toLowerCase() === providerName.toLowerCase()
     );
-    const needsImageUrl = provider?.transformer?.use?.includes("openrouter");
+    // Dynamic format decision
+    const modelSpec = (req.body.model || "").split(",");
+    const targetModel = modelSpec[1] || modelSpec[0] || "";
+    const isOpenRouter = !!provider?.transformer?.use?.includes("openrouter");
+    const isGoogleGemini = /gemini/i.test(targetModel);
+    const imageCfg = config.Image || {};
+    // Allow override via config.Image.forceImageUrl = true/false
+    // Default policy:
+    //  - For openrouter+gemini: send Anthropic style base64 part (openrouter will adapt) -> no image_url
+    //  - For other openrouter vision models: use image_url data URI
+    //  - For non-openrouter: keep original part
+    let needsImageUrl = false;
+    if (imageCfg.forceImageUrl === true) {
+      needsImageUrl = true;
+    } else if (imageCfg.forceImageUrl === false) {
+      needsImageUrl = false;
+    } else if (isOpenRouter && !isGoogleGemini) {
+      needsImageUrl = true;
+    }
+    req.log?.debug?.(
+      `[imageAgent] format decision provider=${providerName} targetModel=${targetModel} openrouter=${isOpenRouter} gemini=${isGoogleGemini} needsImageUrl=${needsImageUrl}`
+    );
 
     // Determine a stable session key (match router session logic if possible)
     let sessionKey = req.id;
@@ -361,15 +382,34 @@ Always ensure that your response reflects a clear, accurate interpretation of th
               rebuilt.push(placeholder);
             } else {
               // hybrid
-              if (needsImageUrl) {
+              // Validate base64 roughly (length & charset) before any conversion
+              const isLikelyBase64 =
+                typeof current.data === "string" &&
+                current.data.length > 100 &&
+                /^[A-Za-z0-9+/=]+$/.test(current.data.replace(/\s+/g, ""));
+              if (!isLikelyBase64) {
+                req.log?.warn?.(
+                  `[imageAgent] skipping image#${current.id} invalid/short base64 length=${current.data?.length}`
+                );
+                // fallback: keep original part if present
+                rebuilt.push(part);
+              } else if (needsImageUrl) {
+                // Use data URI for non-gemini openrouter paths
                 rebuilt.push({
                   type: "image_url",
                   image_url: {
                     url: `data:${current.media_type};base64,${current.data}`,
                   },
                 });
+                req.log?.debug?.(
+                  `[imageAgent] attach image#${current.id} as image_url bytes=${current.data.length}`
+                );
               } else {
-                rebuilt.push(part); // leave original
+                // Keep original Anthropic style part
+                rebuilt.push(part);
+                req.log?.debug?.(
+                  `[imageAgent] attach image#${current.id} as base64 part bytes=${current.data.length}`
+                );
               }
               rebuilt.push(placeholder);
             }
