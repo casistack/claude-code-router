@@ -196,7 +196,7 @@ export const router = async (req: any, _res: any, context: any) => {
     // Sanitize outbound images before model decision (ensures routing considers real content)
     try {
       sanitizeAndNormalizeImages(req, config);
-    } catch (e:any) {
+    } catch (e: any) {
       req.log?.warn?.(`image sanitize error: ${e.message}`);
     }
 
@@ -225,40 +225,72 @@ export const router = async (req: any, _res: any, context: any) => {
 
 // --- Image sanitation / normalization ---
 function sanitizeAndNormalizeImages(req: any, config: any) {
-  const body = req.body || {}; if (!Array.isArray(body.messages)) return;
-  const modelSpec = (body.model || '').split(',');
-  const targetModel = modelSpec[1] || modelSpec[0] || '';
+  const body = req.body || {};
+  if (!Array.isArray(body.messages)) return;
+  const modelSpec = (body.model || "").split(",");
+  const targetModel = modelSpec[1] || modelSpec[0] || "";
   const isGemini = /gemini/i.test(targetModel);
-  let kept = 0, dropped = 0, converted = 0, placeholders = 0;
+  let kept = 0,
+    dropped = 0,
+    converted = 0,
+    placeholders = 0;
   body.messages.forEach((msg: any) => {
     if (!Array.isArray(msg.content)) return;
     msg.content = msg.content.flatMap((part: any) => {
-      if (part?.type === 'text' && /\[Image #\d+\]/.test(part.text || '')) { placeholders++; return [part]; }
-      if (part?.type === 'image_url') {
-        const url = part.image_url?.url || '';
-        const comma = url.indexOf(',');
-        if (comma === -1) { dropped++; return []; }
+      if (part?.type === "text" && /\[Image #\d+\]/.test(part.text || "")) {
+        placeholders++;
+        return [part];
+      }
+      if (part?.type === "image_url") {
+        const url = part.image_url?.url || "";
+        const comma = url.indexOf(",");
+        if (comma === -1) {
+          dropped++;
+          return [];
+        }
         const mediaMatch = /^data:([^;]+);base64,/.exec(url);
         const base = url.slice(comma + 1);
-        if (!mediaMatch || base.length < 100 || !/^[A-Za-z0-9+/=]+$/.test(base)) { dropped++; return []; }
+        if (
+          !mediaMatch ||
+          base.length < 100 ||
+          !/^[A-Za-z0-9+/=]+$/.test(base)
+        ) {
+          dropped++;
+          return [];
+        }
         if (isGemini) {
           converted++;
-          return [{ type: 'image', source: { type: 'base64', media_type: mediaMatch[1], data: base } }];
+          return [
+            {
+              type: "image",
+              source: { type: "base64", media_type: mediaMatch[1], data: base },
+            },
+          ];
         }
-        kept++; return [part];
+        kept++;
+        return [part];
       }
-      if (part?.type === 'image' && part.source?.type === 'base64') {
-        const data = part.source.data || '';
-        if (data.length < 100 || !/^[A-Za-z0-9+/=]+$/.test(data)) { dropped++; return []; }
-        kept++; return [part];
+      if (part?.type === "image" && part.source?.type === "base64") {
+        const data = part.source.data || "";
+        if (data.length < 100 || !/^[A-Za-z0-9+/=]+$/.test(data)) {
+          dropped++;
+          return [];
+        }
+        kept++;
+        return [part];
       }
       return [part];
     });
   });
   // If only placeholders remain without any images kept/converted and no tool usage yet, add guidance
-  if ((kept + converted) === 0 && placeholders > 0) {
+  if (kept + converted === 0 && placeholders > 0) {
     body.system = body.system || [];
-    body.system.push({ type:'text', text: 'Image data not present for referenced placeholders. Ask the user to resend the image or call analyzeImage if available.' });
+    body.system.push({
+      type: "text",
+      text: "Image data not present for referenced placeholders. Ask the user to resend the image or call analyzeImage if available.",
+    });
   }
-  req.log?.debug?.(`[imageSanitize] kept=${kept} converted=${converted} dropped=${dropped} placeholders=${placeholders} gemini=${isGemini}`);
+  req.log?.debug?.(
+    `[imageSanitize] kept=${kept} converted=${converted} dropped=${dropped} placeholders=${placeholders} gemini=${isGemini}`
+  );
 }
