@@ -1,4 +1,6 @@
+// Type import may not have bundled d.ts; using any fallback for now
 import Server from "@musistudio/llms";
+import type { FastifyRequest, FastifyReply } from 'fastify';
 import { readConfigFile, writeConfigFile, backupConfigFile } from "./utils";
 import { checkForUpdates, performUpdate } from "./utils";
 import { join } from "path";
@@ -6,11 +8,74 @@ import fastifyStatic from "@fastify/static";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { homedir } from "os";
 
-export const createServer = (config: any): Server => {
+export const createServer = (config: any): any => {
   const server = new Server(config);
 
+  // Outbound request sanitation hook for image content (applies to /v1/messages)
+  server.app.addHook('preHandler', async (req: FastifyRequest & { routerPath?: string; log?: any; body?: any }, reply: FastifyReply) => {
+    try {
+      if (req.routerPath !== '/v1/messages' || req.method !== 'POST') return;
+      const body = req.body;
+      if (!body || !Array.isArray(body.messages)) return;
+      const modelSpec = (body.model || '').split(',');
+      const targetModel = modelSpec[1] || modelSpec[0] || '';
+      const isGemini = /gemini/i.test(targetModel);
+
+      let kept = 0, dropped = 0, converted = 0, placeholders = 0;
+      body.messages.forEach((m: any) => {
+        if (!Array.isArray(m.content)) return;
+        m.content = m.content.flatMap((part: any) => {
+          if (part?.type === 'text' && /\[Image #\d+\]/.test(part.text || '')) {
+            placeholders++; return [part];
+          }
+          // image_url normalization
+            if (part?.type === 'image_url') {
+              const url = part.image_url?.url || '';
+              const idx = url.indexOf(',');
+              if (idx === -1) { dropped++; return []; }
+              const base = url.slice(idx + 1);
+              const mtMatch = /^data:([^;]+);base64,/.exec(url);
+              if (base.length < 100 || !/^[A-Za-z0-9+/=]+$/.test(base)) { dropped++; return []; }
+              if (isGemini) {
+                converted++;
+                return [{ type: 'image', source: { type: 'base64', media_type: (mtMatch?mtMatch[1]:'image/png'), data: base }}];
+              }
+              kept++; return [part];
+            }
+          // raw image validation
+          if (part?.type === 'image' && part.source?.type === 'base64') {
+            const data = part.source.data || '';
+            if (data.length < 100 || !/^[A-Za-z0-9+/=]+$/.test(data)) { dropped++; return []; }
+            kept++; return [part];
+          }
+          return [part];
+        });
+      });
+      // If placeholders remain but all images gone and request only relies on them, append guidance
+      const totalImages = kept + converted;
+      if (placeholders > 0 && totalImages === 0) {
+        body.system = body.system || [];
+        body.system.push({
+          type: 'text',
+          text: 'Placeholders referenced but no image data present. Ask user to resend the image(s) or invoke analyzeImage only after images are re-sent.'
+        });
+      }
+      req.log?.debug?.(`[imageSend] model=${targetModel} kept=${kept} converted=${converted} dropped=${dropped} placeholders=${placeholders}`);
+      // Redacted sample for debugging (first valid image length)
+      if (kept + converted > 0) {
+        const firstMsg = body.messages.find((m: any) => Array.isArray(m.content) && m.content.some((p: any) => p.type === 'image'));
+        const firstImg = firstMsg?.content.find((p: any) => p.type === 'image');
+        if (firstImg?.source?.data) {
+          req.log?.debug?.(`[imageSend] firstImageBytes=${firstImg.source.data.length}`);
+        }
+      }
+    } catch (e) {
+      req.log?.warn?.(`[imageSend] sanitizer error: ${(e as Error).message}`);
+    }
+  });
+
   // Add endpoint to read config.json with access control
-  server.app.get("/api/config", async (req, reply) => {
+  server.app.get("/api/config", async (req: FastifyRequest, reply: FastifyReply) => {
     return await readConfigFile();
   });
 
@@ -27,7 +92,7 @@ export const createServer = (config: any): Server => {
   });
 
   // Add endpoint to save config.json with access control
-  server.app.post("/api/config", async (req, reply) => {
+  server.app.post("/api/config", async (req: FastifyRequest, reply: FastifyReply) => {
     const newConfig = req.body;
 
     // Backup existing config file if it exists
@@ -41,7 +106,7 @@ export const createServer = (config: any): Server => {
   });
 
   // Add endpoint to restart the service with access control
-  server.app.post("/api/restart", async (req, reply) => {
+  server.app.post("/api/restart", async (req: FastifyRequest, reply: FastifyReply) => {
     reply.send({ success: true, message: "Service restart initiated" });
 
     // Restart the service after a short delay to allow response to be sent
@@ -67,7 +132,7 @@ export const createServer = (config: any): Server => {
   });
 
   // 版本检查端点
-  server.app.get("/api/update/check", async (req, reply) => {
+  server.app.get("/api/update/check", async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       // 获取当前版本
       const currentVersion = require("../package.json").version;
@@ -85,7 +150,7 @@ export const createServer = (config: any): Server => {
   });
 
   // 执行更新端点
-  server.app.post("/api/update/perform", async (req, reply) => {
+  server.app.post("/api/update/perform", async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       // 只允许完全访问权限的用户执行更新
       const accessLevel = (req as any).accessLevel || "restricted";
@@ -105,7 +170,7 @@ export const createServer = (config: any): Server => {
   });
 
   // 获取日志文件列表端点
-  server.app.get("/api/logs/files", async (req, reply) => {
+  server.app.get("/api/logs/files", async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const logDir = join(homedir(), ".claude-code-router", "logs");
       const logFiles: Array<{ name: string; path: string; size: number; lastModified: string }> = [];
@@ -139,7 +204,7 @@ export const createServer = (config: any): Server => {
   });
 
   // 获取日志内容端点
-  server.app.get("/api/logs", async (req, reply) => {
+  server.app.get("/api/logs", async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const filePath = (req.query as any).file as string;
       let logFilePath: string;
@@ -167,7 +232,7 @@ export const createServer = (config: any): Server => {
   });
 
   // 清除日志内容端点
-  server.app.delete("/api/logs", async (req, reply) => {
+  server.app.delete("/api/logs", async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const filePath = (req.query as any).file as string;
       let logFilePath: string;
