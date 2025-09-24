@@ -58,31 +58,62 @@ export class ImageAgent implements IAgent {
     try {
       if (!config.Router.image || req.body.model === config.Router.image)
         return false;
-      const lastMessage = req.body.messages[req.body.messages.length - 1];
-      const lastHasImage =
-        lastMessage?.role === "user" &&
-        Array.isArray(lastMessage.content) &&
-        lastMessage.content.find((item: any) => item.type === "image");
-      if (!config.forceUseImageAgent && lastHasImage) {
-        const prevModel = req.body.model;
-        req.body.model = config.Router.image;
-        req.log?.debug?.(
-          `[imageAgent] Auto-switched model ${prevModel} -> ${req.body.model}`
-        );
-        return false;
-      }
+
       const anyImage = req.body.messages.some(
         (msg: any) =>
           msg.role === "user" &&
           Array.isArray(msg.content) &&
           msg.content.some((item: any) => item.type === "image")
       );
-      if (anyImage) {
+      if (!anyImage) return false;
+
+      // If forceUseImageAgent is true, always use tool-based approach
+      if (config.forceUseImageAgent) {
         req.log?.debug?.(
-          "[imageAgent] Detected image(s); enabling image agent tool flow"
+          "[imageAgent] Force mode: enabling image agent tool flow"
+        );
+        return true;
+      }
+
+      // If forceUseImageAgent is false, just switch model and skip agent processing
+      // This preserves images in the message for direct provider handling
+      const prevModel = req.body.model;
+      req.body.model = config.Router.image;
+
+      // Convert image format based on target provider's transformer requirements
+      const [providerName] = req.body.model.split(",");
+      const targetProvider = config.Providers?.find(
+        (p: any) => p.name.toLowerCase() === providerName.toLowerCase()
+      );
+
+      if (targetProvider?.transformer?.use?.includes("openrouter")) {
+        // Convert Anthropic-style images to OpenRouter/OpenAI format
+        req.body.messages.forEach((msg: any) => {
+          if (msg.role === "user" && Array.isArray(msg.content)) {
+            msg.content = msg.content.map((part: any) => {
+              if (part.type === "image" && part.source?.type === "base64") {
+                const mediaType = part.source.media_type || "image/png";
+                const base64Data = part.source.data;
+                return {
+                  type: "image_url",
+                  image_url: {
+                    url: `data:${mediaType};base64,${base64Data}`,
+                  },
+                };
+              }
+              return part;
+            });
+          }
+        });
+        req.log?.debug?.(
+          `[imageAgent] Converted image format for ${targetProvider.name} transformer`
         );
       }
-      return anyImage;
+
+      req.log?.debug?.(
+        `[imageAgent] Auto-switched model ${prevModel} -> ${req.body.model}, skipping image processing`
+      );
+      return false;
     } catch (e) {
       req.log?.warn?.(
         `[imageAgent] shouldHandle error: ${(e as Error).message}`
