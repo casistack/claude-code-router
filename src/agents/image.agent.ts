@@ -74,12 +74,16 @@ export class ImageAgent implements IAgent {
       );
       if (!hasRawImage && !hasPlaceholder) return false;
 
-      // Switch model if not already
-      if (req.body.model !== config.Router.image) {
+      // Switch model only when raw image data exists
+      if (hasRawImage && req.body.model !== config.Router.image) {
         const prev = req.body.model;
         req.body.model = config.Router.image;
         req.log?.debug?.(
           `[imageAgent] model -> ${req.body.model} (prev=${prev}) mode=${mode} raw=${hasRawImage} placeholder=${hasPlaceholder}`
+        );
+      } else if (!hasRawImage && hasPlaceholder) {
+        req.log?.debug?.(
+          "[imageAgent] Placeholder-only reference detected; leaving model unchanged"
         );
       }
 
@@ -146,10 +150,20 @@ export class ImageAgent implements IAgent {
 
         // Create image messages from cached images
         if (args.imageId && Array.isArray(args.imageId)) {
+          const sessionKeys = new Set<string>();
+          sessionKeys.add(context.req.id);
+          const metaUserId = context.req.body?.metadata?.user_id;
+          if (metaUserId) {
+            const parts = metaUserId.split("_session_");
+            if (parts.length > 1) sessionKeys.add(parts[1]);
+          }
+
           args.imageId.forEach((imgId: string) => {
-            const image = imageCache.getImage(
-              `${context.req.id}_Image#${imgId}`
-            );
+            let image = null;
+            for (const key of sessionKeys) {
+              image = imageCache.getImage(`${key}_Image#${imgId}`);
+              if (image) break;
+            }
             if (image) {
               imageMessages.push({
                 type: "image",
@@ -230,6 +244,17 @@ Always ensure that your response reflects a clear, accurate interpretation of th
     const userMessages = req.body.messages.filter(
       (m: any) => m.role === "user" && Array.isArray(m.content)
     );
+    const placeholderIds = new Set<number>();
+    userMessages.forEach((m: any) =>
+      m.content.forEach((part: any) => {
+        if (part.type === "text" && typeof part.text === "string") {
+          const matches = part.text.matchAll(/\[Image #(\d+)\]/g);
+          for (const match of matches) {
+            placeholderIds.add(Number(match[1]));
+          }
+        }
+      })
+    );
     // Collect raw images (only once per request)
     let nextId = 1;
     const images: {
@@ -254,17 +279,62 @@ Always ensure that your response reflects a clear, accurate interpretation of th
       })
     );
 
-    const hasPlaceholdersOnly =
-      !images.length &&
-      userMessages.some((m: any) =>
-        m.content.some(
-          (p: any) => p.type === "text" && /\[Image #\d+\]/.test(p.text)
-        )
-      );
+    const hasPlaceholdersOnly = !images.length && placeholderIds.size > 0;
     if (hasPlaceholdersOnly) {
+      const available: number[] = [];
+      const missing: number[] = [];
+      placeholderIds.forEach((id) => {
+        const sessionKeyCandidate = `${sessionKey}_Image#${id}`;
+        const reqKeyCandidate = `${req.id}_Image#${id}`;
+        if (
+          imageCache.hasImage(sessionKeyCandidate) ||
+          imageCache.hasImage(reqKeyCandidate)
+        ) {
+          available.push(id);
+        } else {
+          missing.push(id);
+        }
+      });
+
+      let guidance: string;
+      if (!available.length) {
+        guidance =
+          "The user referenced image placeholders, but no image data is cached. Do NOT describe or guess. Ask the user to resend the image (paste again) or provide a file path.";
+      } else if (missing.length) {
+        guidance = `Image data found for ${available
+          .map((id) => `[Image #${id}]`)
+          .join(", ")} but missing for ${missing
+          .map((id) => `[Image #${id}]`)
+          .join(
+            ", "
+          )}. Do not invent details. Offer to analyze the available images via the analyzeImage tool and request the user resend the missing ones.`;
+      } else {
+        guidance = `Image data is cached for ${Array.from(placeholderIds)
+          .map((id) => `[Image #${id}]`)
+          .join(
+            ", "
+          )}. You must call analyzeImage with the relevant imageId values to answer; do not describe the images directly.`;
+
+        // Surface metadata for downstream use
+        const imageMetas = Array.from(placeholderIds).map((id) => {
+          const cacheSource =
+            imageCache.getImage(`${sessionKey}_Image#${id}`) ||
+            imageCache.getImage(`${req.id}_Image#${id}`);
+          return {
+            id,
+            media_type: cacheSource?.media_type || "image/png",
+          };
+        });
+        (req as any)._ccrImages = imageMetas;
+      }
+
+      req.log?.debug?.(
+        `[imageAgent] Placeholder-only request processed (available=${available.length}, missing=${missing.length})`
+      );
+
       req.body?.system?.push({
         type: "text",
-        text: `Image reference(s) detected but no cached image data in this session. Ask the user to resend the image (paste again) or provide a file path for analysis.`,
+        text: guidance,
       });
       return;
     }
@@ -311,10 +381,15 @@ Always ensure that your response reflects a clear, accurate interpretation of th
       });
     }
 
-    if (mode === "tool" || mode === "hybrid") {
+    if (mode === "tool") {
       req.body?.system?.push({
         type: "text",
-        text: `Hybrid image handling active (mode=${mode}). Inline images may appear. Provide direct descriptions when user asks plainly. For OCR, region/layout, object enumeration, safety checks, comparisons or structured extraction, call analyzeImage with imageId(s). Never fabricate visual details.`,
+        text: `Image tool mode active. You cannot perceive images directly. Whenever a user references [Image #n], you MUST call analyzeImage with the corresponding imageId array to obtain visual information. Never describe or guess image content yourself. Request the image again if it's unavailable.`,
+      });
+    } else if (mode === "hybrid") {
+      req.body?.system?.push({
+        type: "text",
+        text: `Hybrid image handling active. Inline images may appear for quick descriptions, but tasks requiring OCR, regions, object enumeration, safety checks, or comparisons must use analyzeImage with the relevant imageId(s). Never fabricate visual details.`,
       });
     }
   }
